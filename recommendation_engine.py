@@ -25,16 +25,31 @@ class RecommendationEngine:
             'add_to_cart': 'sum',
             'purchase': 'sum'
         }).reset_index()
-        
+
+        coef_click = self.product_popularity['purchase'].sum() / max(self.product_popularity['click'].sum(), 1)
+        coef_cart = self.product_popularity['purchase'].sum() / max(self.product_popularity['add_to_cart'].sum(), 1)
+        coef_purchase = 1
+
+        print(f"[DEBUG] Коэффициенты: click={coef_click:.3f}, add_to_cart={coef_cart:.3f}, purchase={coef_purchase}")
+
+        # Рассчитываем нормализованный popularity_score
         self.product_popularity['popularity_score'] = (
-            self.product_popularity['click'] * 1 +
-            self.product_popularity['add_to_cart'] * 3 +
-            self.product_popularity['purchase'] * 5
+            self.product_popularity['click'] * coef_click +
+            self.product_popularity['add_to_cart'] * coef_cart +
+            self.product_popularity['purchase'] * coef_purchase
         )
         
         # Сортируем по популярности
         self.product_popularity = self.product_popularity.sort_values(
             'popularity_score', ascending=False
+        )
+        
+        # Создаём словарь pid -> brand для быстрого доступа
+        self.product_brands = (
+            self.df[['pid', 'brand']]
+            .drop_duplicates('pid')
+            .set_index('pid')['brand']
+            .to_dict()
         )
         
         # Подготовка данных
@@ -54,8 +69,6 @@ class RecommendationEngine:
         # Группируем по пользователям
         user_purchases = purchases.groupby('uid')['pid'].apply(list).to_dict()
 
-        # Для каждой пары товаров, купленных одним пользователем,
-        # увеличиваем счетчик совместных покупок
         cooccur_counts = defaultdict(lambda: defaultdict(int))
         
         for uid, products in user_purchases.items():
@@ -88,13 +101,6 @@ class RecommendationEngine:
         if user_data.empty:
             return []
 
-        product_brands = (
-            self.df[['pid', 'brand']]
-            .drop_duplicates('pid')
-            .set_index('pid')['brand']
-            .to_dict()
-        )
-
         # Все товары, с которыми пользователь взаимодействовал (клик/корзина/покупка)
         interested_products = set(
             user_data[
@@ -107,61 +113,84 @@ class RecommendationEngine:
         print(f"[INFO] uid={uid} | interested_products={len(interested_products)}")
 
         recommendations: List[int] = []
-        brand_count = defaultdict(int)
 
         # 1) Аггрегируем co-occurrence по всем интересным товарам с подсчетом частоты
         candidate_counts = defaultdict(int)
         for seed_pid in interested_products:
             if seed_pid in self.cooccurrence:
                 for similar_pid in self.cooccurrence[seed_pid]:
-                    if similar_pid in interested_products:
-                        continue  # не показываем то, что уже видел/брал
-                    candidate_counts[similar_pid] += 1
+                    if similar_pid not in interested_products:
+                        candidate_counts[similar_pid] += 1
 
         # Сортируем кандидатов по убыванию встречаемости (релевантности)
         ranked_candidates = sorted(
             candidate_counts.items(), key=lambda x: x[1], reverse=True
         )
 
+        seen_items = set()  
         for pid, count in ranked_candidates:
-            brand = product_brands.get(pid, 'unknown')
-            if brand_count[brand] >= 2:
-                continue
-            if pid in recommendations:
+            brand = self.product_brands.get(pid, 'unknown')
+            if (pid, brand) in seen_items:
                 continue
             recommendations.append(pid)
-            brand_count[brand] += 1
+            seen_items.add((pid, brand))
             print(f"[INFO] uid={uid} | add cooccur pid={pid} brand={brand} freq={count}")
             if len(recommendations) >= 5:
                 break
 
-        # 2) Фоллбек: добавляем популярные товары, избегая интересных, с лимитом 2 на бренд
+        # 2) Фоллбек: добавляем популярные товары, если меньше 5
         if len(recommendations) < 5:
-            for _, row in self.product_popularity.iterrows():
-                pid, brand = row['pid'], row['brand']
-                if pid in interested_products:
-                    continue
-                if pid in recommendations:
-                    continue
-                if brand_count[brand] >= 1:
-                    continue
-                recommendations.append(pid)
-                brand_count[brand] += 1
-                print(f"[INFO] uid={uid} | add popular pid={pid} brand={brand}")
-                if len(recommendations) >= 5:
-                    break
+            recommendations = self.fill_with_popular_products(
+                recommendations, 
+                interested_products=interested_products,
+                uid=uid
+            )
 
+        return recommendations
+    
+    def fill_with_popular_products(
+        self, 
+        recommendations: List[int], 
+        max_count: int = 5, 
+        brand_limit: int = 2,
+        interested_products: set = None,
+        uid: int = None
+    ) -> List[int]:
+        seen_items = set()  
+        
+        
+        for pid in recommendations:
+            brand = self.product_brands.get(pid, 'unknown')
+            seen_items.add((pid, brand))
+        
+        if interested_products is None:
+            interested_products = set()
+        
+        for row in self.product_popularity.itertuples(index=False):
+            pid, brand = row.pid, row.brand
+            if pid in interested_products:
+                continue
+            if (pid, brand) in seen_items:
+                continue
+            recommendations.append(pid)
+            seen_items.add((pid, brand))
+            if uid is not None:
+                print(f"[INFO] uid={uid} | add popular pid={pid} brand={brand}")
+            if len(recommendations) >= max_count:
+                break
+        
         return recommendations
     
     def get_recommendations(self, uid: int) -> Dict[str, any]:
         # Проверяем, есть ли пользователь в истории
         user_exists = uid in self.user_product_stats['uid'].values
+        recommendations: List[int] = []
         
         if user_exists:
             recommendations = self.get_recommendations_for_existing_user(uid)
         else:
-
-            recommendations = []
+            # Для новых пользователей сразу популярные товары
+            recommendations = self.fill_with_popular_products(recommendations, uid=uid)
         
         return {
             "uid": uid,

@@ -1,12 +1,13 @@
-import argparse
-from collections import defaultdict
-from typing import Dict, List
 import random
 import pandas as pd
+from collections import defaultdict
+from typing import Dict, List
+from cache import CacheManager
 
 
 class RecommendationEngine:
     def __init__(self, data_path: str):
+        self.cache = CacheManager()
         self.df = pd.read_csv(data_path)
         self._prepare_data()
     
@@ -44,19 +45,34 @@ class RecommendationEngine:
             'popularity_score', ascending=False
         )
         
-        # Создаём словарь pid -> brand для быстрого доступа
-        self.product_brands = (
-            self.df[['pid', 'brand']]
-            .drop_duplicates('pid')
-            .set_index('pid')['brand']
-            .to_dict()
-        )
+        # Пытаемся загрузить product_brands из кэша
+        self.product_brands = self.cache.load_product_brands()
+        
+        # Если кэш пустой, создаём и сохраняем
+        if not self.product_brands:
+            self.product_brands = (
+                self.df[['pid', 'brand']]
+                .drop_duplicates('pid')
+                .set_index('pid')['brand']
+                .to_dict()
+            )
+            self.cache.save_product_brands(self.product_brands)
         
         # Подготовка данных
         self._prepare_cooccurrence()
     
     def _prepare_cooccurrence(self):
         #Подготовка матрицы совместных покупок (co-occurrence).
+        
+        # Попытка загрузить из кэша
+        cached_cooc = self.cache.load_cooccurrence()
+        if cached_cooc is not None:
+            print(f"[CACHE] Загружено {len(cached_cooc)} co-occurrence записей из кэша")
+            self.cooccurrence = defaultdict(list, cached_cooc)
+            return
+        
+        print("[INFO] Кэш пуст, строим co-occurrence матрицу...")
+        
         # Получаем покупки и товары из корзины
         purchases = self.user_product_stats[
             (self.user_product_stats['purchase'] > 0) |
@@ -92,6 +108,13 @@ class RecommendationEngine:
                 sorted_randomized.extend(products)
 
             self.cooccurrence[pid] = sorted_randomized
+        
+        # Сохраняем co-occurrence в кэш
+        self.cache.save_cooccurrence(dict(self.cooccurrence))
+        
+        # Сохраняем список популярных товаров в кэш (преобразуем int64 в int)
+        popular_list = [int(x) for x in self.product_popularity['pid'].head(100).values]
+        self.cache.save_popular_products(popular_list)
 
     def get_recommendations_for_existing_user(self, uid: int) -> List[int]:
         user_data = self.user_product_stats[
@@ -99,7 +122,7 @@ class RecommendationEngine:
         ].copy()
 
         if user_data.empty:
-            return []
+            return self.fill_with_popular_products([], uid=uid)
 
         # Все товары, с которыми пользователь взаимодействовал (клик/корзина/покупка)
         interested_products = set(
@@ -122,7 +145,6 @@ class RecommendationEngine:
                     if similar_pid not in interested_products:
                         candidate_counts[similar_pid] += 1
 
-        # Сортируем кандидатов по убыванию встречаемости (релевантности)
         ranked_candidates = sorted(
             candidate_counts.items(), key=lambda x: x[1], reverse=True
         )
@@ -182,49 +204,15 @@ class RecommendationEngine:
         return recommendations
     
     def get_recommendations(self, uid: int) -> Dict[str, any]:
-        # Проверяем, есть ли пользователь в истории
         user_exists = uid in self.user_product_stats['uid'].values
         recommendations: List[int] = []
         
         if user_exists:
             recommendations = self.get_recommendations_for_existing_user(uid)
         else:
-            # Для новых пользователей сразу популярные товары
             recommendations = self.fill_with_popular_products(recommendations, uid=uid)
         
         return {
             "uid": uid,
             "products": recommendations[:5]  
         }
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run recommendations from console")
-    parser.add_argument("--uid", type=int, help="User id for recommendations")
-    parser.add_argument("--data", type=str, default="data.csv", help="Path to CSV data file")
-    parser.add_argument("--print-cooccurrence", action="store_true", help="Print truncated co-occurrence matrix")
-    parser.add_argument("--max-seeds", type=int, default=10, help="How many seed products to show in co-occurrence print")
-    parser.add_argument("--max-sims", type=int, default=5, help="How many similar products to show per seed")
-    args = parser.parse_args()
-
-    uid = args.uid
-    if uid is None:
-        try:
-            uid = int(input("Enter user id (uid): "))
-        except Exception:
-            print("uid is required")
-            raise SystemExit(1)
-
-    engine = RecommendationEngine(args.data)
-
-    if args.print_cooccurrence:
-        print("=== Co-occurrence (truncated) ===")
-        seeds = list(engine.cooccurrence.items())
-        for pid, sims in seeds[:args.max_seeds]:
-            print(f"seed {pid}: {sims[:args.max_sims]}")
-        if len(seeds) > args.max_seeds:
-            print(f"... truncated {len(seeds) - args.max_seeds} more seeds")
-
-    recs = engine.get_recommendations(uid)
-    print("=== Recommendations ===")
-    print(recs)

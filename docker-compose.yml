@@ -1,0 +1,43 @@
+services:
+  # KeyDB (Redis-совместимое хранилище)
+  keydb:
+    image: eqalpha/keydb:latest
+    container_name: rec_keydb
+    volumes:
+      - keydb_data:/data
+    healthcheck:
+      test: ["CMD", "keydb-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - rec_network
+
+  # FastAPI приложение
+  app:
+    build: .
+    container_name: rec_app
+    ports:
+      - "8000:8000"
+    depends_on:
+      keydb:
+        condition: service_healthy
+    environment:
+      - KEYDB_HOST=keydb
+      - KEYDB_PORT=6379
+    volumes:
+      - .:/app
+    networks:
+      - rec_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  keydb_data:
+
+networks:
+  rec_network:
+    driver: bridge

@@ -1,7 +1,3 @@
-"""
-Менеджер для кэширования данных RecommendationEngine в KeyDB.
-"""
-
 import json
 import os
 try:
